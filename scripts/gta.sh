@@ -1,0 +1,4 @@
+# python main_tip_finetune.py --world-size 1 --dataset gta --data-root gta/ --partitions train test --image-path images --output-dir checkpoints/gta/sam --use_insadapter --num_classes 12 --clip_dir_vit checkpoints/pretrained_clip/ViT-B-16.pt --prompt_learning --LA --epochs 20 --use_sam --sam_path gsam
+
+
+python main_tip_finetune.py --world-size 1 --dataset gta --data-root gta/ --partitions train test --image-path images --output-dir checkpoints/gta --use_insadapter --num_classes 12 --clip_dir_vit checkpoints/pretrained_clip/ViT-B-16.pt --prompt_learning --LA --epochs 20 --eval --use_sam --sam_path gsam --resume gta/sam/ckpt_03600_05.pt

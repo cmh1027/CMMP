@@ -55,11 +55,6 @@ class TransformerDecoderLayer(nn.Module):
                      memory_key_padding_mask: Optional[Tensor] = None,
                      pos: Optional[Tensor] = None,
                      query_pos: Optional[Tensor] = None):
-        # q = k = self.with_pos_embed(tgt, query_pos)
-        # tgt2 = self.self_attn(q, k, value=tgt, attn_mask=tgt_mask,
-        #                       key_padding_mask=tgt_key_padding_mask)[0]
-        # tgt = tgt + self.dropout1(tgt2)
-        # tgt = self.norm1(tgt)
         tgt2, attentions = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
                                    key=self.with_pos_embed(memory, pos),
                                    value=memory, attn_mask=memory_mask,
@@ -79,11 +74,6 @@ class TransformerDecoderLayer(nn.Module):
                     pos: Optional[Tensor] = None,
                     query_pos: Optional[Tensor] = None):
         tgt2 = self.norm1(tgt)
-        # q = k = self.with_pos_embed(tgt2, query_pos)
-        # tgt2 = self.self_attn(q, k, value=tgt2, attn_mask=tgt_mask,
-        #                       key_padding_mask=tgt_key_padding_mask)[0]
-        # tgt = tgt + self.dropout1(tgt2)
-        # tgt2 = self.norm2(tgt)
         tgt2, attentions = self.multihead_attn(query=self.with_pos_embed(tgt2, query_pos),
                                    key=self.with_pos_embed(memory, pos),
                                    value=memory, attn_mask=memory_mask,
@@ -176,8 +166,6 @@ class Adapter(nn.Module):
                                                 self.dropout, 'relu', False)
         instance_decoder_norm = nn.LayerNorm(d_model)
         self.mhsa_layers = _get_clones(instance_decoder_layer, adapter_num_layers)
-        # self.mhsa = TransformerDecoderLayer(self.down_size, 2, self.down_size*2,
-        #                                         self.dropout, 'relu', False)
 
     def forward(self, x, prior=None):
         down = self.down_proj(x)
@@ -734,18 +722,6 @@ class CLIP_ResNet(nn.Module):
                     if name.endswith("bn3.weight"):
                         nn.init.zeros_(param)
 
-        # proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
-        # attn_std = self.transformer.width ** -0.5
-        # fc_std = (2 * self.transformer.width) ** -0.5
-        # for block in self.transformer.resblocks:
-        #     nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
-        #     nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
-        #     nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
-        #     nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
-
-        # if self.text_projection is not None:
-        #     nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
-
     def build_attention_mask(self):
         # lazily create causal attention mask, with full attention between the vision tokens
         # pytorch uses additive attention mask; fill with -inf
@@ -1014,12 +990,6 @@ def tokenize(texts: Union[str, List[str]], context_length: int = 77, truncate: b
 
     sot_token = _tokenizer.encoder["<|startoftext|>"]
     eot_token = _tokenizer.encoder["<|endoftext|>"]
-    # all_tokens = [[sot_token] + _tokenizer.encode(text) + [eot_token] for text in texts]
-    
-    # if return_sot:
-    #     all_tokens = [[sot_token] + _tokenizer.encode(text) for text in texts]
-    # else:
-    #     all_tokens = [_tokenizer.encode(text) + [eot_token] for text in texts]
     all_tokens = [[sot_token] + _tokenizer.encode(text) + [eot_token] for text in texts]
     if packaging.version.parse(torch.__version__) < packaging.version.parse("1.8.0"):
         result = torch.zeros(len(all_tokens), context_length, dtype=torch.long)

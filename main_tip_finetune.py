@@ -124,11 +124,9 @@ def main(rank, args):
     elif args.clip_model_name == 'ViT-L-14-336px':
         args.clip_model_name = 'ViT-L/14@336px'
     
-    trainset = DataFactory(name=args.dataset, partition=args.partitions[0], data_root=args.data_root, clip_model_name=args.clip_model_name, zero_shot=args.zs, zs_type=args.zs_type, num_classes=args.num_classes)
-    testset = DataFactory(name=args.dataset, partition=args.partitions[1], data_root=args.data_root, clip_model_name=args.clip_model_name)
-    verb2interaction = None
-    # trainset[0][1]: dict_keys(['boxes_h', 'boxes_o', 'hoi', 'object', 'verb', 'orig_size', 'labels', 'size', 'filename'])
-    # trainset[0][0]: (torch.Size([3, 814, 640]), torch.Size([3, 224, 224]))
+    trainset = DataFactory(name=args.dataset, partition=args.partitions[0], data_root=args.data_root, image_path=args.image_path, clip_model_name=args.clip_model_name, zero_shot=args.zs, zs_type=args.zs_type, num_classes=args.num_classes)
+    testset = DataFactory(name=args.dataset, partition=args.partitions[1], data_root=args.data_root, image_path=args.image_path, clip_model_name=args.clip_model_name)
+
     if args.dataset == 'vcoco':
         class_corr = vcoco_class_corr()
         trainset.dataset.class_corr = class_corr
@@ -137,7 +135,6 @@ def main(rank, args):
         trainset.dataset.object_n_verb_to_interaction = object_n_verb_to_interaction
         testset.dataset.object_n_verb_to_interaction = object_n_verb_to_interaction
 
-    # args.hoi_cooccurence = tranverse_and_get_hoi_cooccurence(trainset.dataset)
     if args.training_set_ratio < 0.9:
         print(f'[INFO]: using {args.training_set_ratio} trainset to train!')
         sub_trainset, valset = trainset.dataset.split(args.training_set_ratio)
@@ -146,7 +143,7 @@ def main(rank, args):
         
     train_loader = DataLoader(
         dataset=trainset,
-        collate_fn=custom_collate, batch_size=args.batch_size,
+        collate_fn=custom_collate, batch_size=1,
         num_workers=args.num_workers, pin_memory=False, drop_last=True,
         sampler=DistributedSampler(
             trainset, 
@@ -168,44 +165,47 @@ def main(rank, args):
             object_to_target = train_loader.dataset.dataset.object_to_verb
         elif args.num_classes == 600:
             object_to_target = train_loader.dataset.dataset.object_to_interaction
-        
         if args.zs:
             object_to_target = train_loader.dataset.zs_object_to_target
+    elif args.dataset == 'gta':
+        assert args.num_classes == 12
+        object_to_target = train_loader.dataset.dataset.object_to_interaction
     elif args.dataset == 'vcoco':
         if args.num_classes == 24:
             object_to_target = list(train_loader.dataset.dataset.object_to_action.values())
         elif args.num_classes == 236:
             raise NotImplementedError
         
-    print('[INFO]: num_classes', args.num_classes)
+    print('[INFO]: num_interaction', args.num_classes)
     if args.dataset == 'vcoco':
         num_anno = None
-    else:
+    elif args.dataset == "hicodet":
         num_anno = torch.as_tensor(trainset.dataset.anno_interaction)
         if args.num_classes == 117:
             num_anno = torch.as_tensor(trainset.dataset.anno_action)
-    upt = build_detector(args, object_to_target, object_n_verb_to_interaction=object_n_verb_to_interaction, clip_model_path=args.clip_dir_vit, num_anno=num_anno, verb2interaction=verb2interaction)
+    elif args.dataset == "gta":
+        num_anno = torch.as_tensor(trainset.dataset.anno_interaction)
+    else:
+        raise NotImplementedError
+    upt = build_detector(args, object_to_target, object_n_verb_to_interaction=object_n_verb_to_interaction, clip_model_path=args.clip_dir_vit, num_anno=num_anno)
+
+
     if args.dataset == 'hicodet' and args.eval:  ## after building model, manually change obj_to_target
         if args.num_classes == 117:
             upt.object_class_to_target_class = test_loader.dataset.dataset.object_to_verb
         else:
             upt.object_class_to_target_class = test_loader.dataset.dataset.object_to_interaction
-    if args.pseudo_label:  ## if we generate pseudo label for unseen verbs,
-        pdb.set_trace()
-        upt.object_class_to_target_class = test_loader.dataset.dataset.object_to_verb
 
-    
-    # input1 = _get_model_analysis_input(train_loader)
-    # device = torch.device("cpu")
-    # upt.init_adapter_union_weight(device)
-    # flops, params = profile(upt, inputs=(input1[0], input1[1]))
-    # print('FLOPs = ' + str(flops/1000**3) + 'G')
-    # print('Params = ' + str(params/1000**2) + 'M')
+    if args.dataset == "gta" and args.eval:
+        upt.object_class_to_target_class = test_loader.dataset.dataset.object_to_interaction
+
+    if args.pseudo_label:  ## if we generate pseudo label for unseen verbs,
+        upt.object_class_to_target_class = test_loader.dataset.dataset.object_to_verb
 
     if os.path.exists(args.resume):
         print(f"===>>> Rank {rank}: continue from saved checkpoint {args.resume}")
         checkpoint = torch.load(args.resume, map_location='cpu')
-        upt.load_state_dict(checkpoint['model_state_dict'])
+        upt.load_state_dict(checkpoint['model_state_dict'], strict=False)
     else:
         print(f"=> Rank {rank}: start from a randomly initialised model")
     
@@ -224,16 +224,6 @@ def main(rank, args):
         upt.logit_scale_HO = torch.nn.Parameter(upt.logit_scale_HO * args.vis_tor)
         upt.logit_scale_U = torch.nn.Parameter(upt.logit_scale_U * args.vis_tor)
 
-    if args.tpt:
-        engine = CustomisedDLE(
-            upt, test_loader_for_tpt,
-            max_norm=args.clip_max_norm,
-            num_classes=args.num_classes,
-            print_interval=args.print_interval,
-            find_unused_parameters=True,
-            cache_dir=args.output_dir,
-        )
-
     if args.cache:
         print("output path:", args.output_dir)
         if args.prompt_learning:
@@ -241,10 +231,14 @@ def main(rank, args):
         if args.dataset == 'hicodet':
             engine.cache_hico(test_loader, args.output_dir)
         elif args.dataset == 'vcoco':
-            # print("[!NOTE!]: using test_loader_of_trainingset")
             engine.cache_vcoco(test_loader, args.output_dir)
         return
-    
+
+    if args.cache_sam:
+        engine.sam_cache(train_loader, os.path.join(args.cache_path, args.dataset))
+        engine.sam_cache(test_loader, os.path.join(args.cache_path, args.dataset))
+        exit()
+
     if args.eval:
         device = torch.device(args.device)
         upt.eval()
@@ -252,19 +246,7 @@ def main(rank, args):
             upt.init_adapter_union_weight(device)
         if args.dataset == 'vcoco':
             raise NotImplementedError(f"Evaluation on V-COCO has not been implemented.")
-
-        if args.eval_trainset:
-            sys.path.append('detr')
-            import detr.datasets.transforms_clip as T
-            trainset.transforms = T.Compose([
-                T.RandomResize([800], max_size=1333),
-            ])
-            test_loader = DataLoader(
-                dataset=trainset,
-                collate_fn=custom_collate, batch_size=1,
-                num_workers=args.num_workers, pin_memory=False, drop_last=False,
-                sampler=torch.utils.data.SequentialSampler(trainset)
-            )
+         
         ap = engine.test_hico(test_loader, args)
 
         # Fetch indices for rare and non-rare classes
@@ -293,94 +275,89 @@ def main(rank, args):
                 f"unseen: {ap_unseen*100:.2f}",
                 f"seen: {ap_seen*100:.2f}",
             )
-            
-        print(args.resume) ## import pickle; pickle.dump({'ap': all_ap_verb, 'zs_flag': all_zs_flag_verb, 'feat': all_feat_verb}, open('analysis/zs_unseen_verb.p', 'wb'))
-        return
-
-    for p in upt.detector.parameters():
-        p.requires_grad = False
-
-    for n, p in upt.clip_head.named_parameters():
-        # if n.startswith('image_encoder.positional_embedding') or n.startswith('image_encoder.ln_post') or n.startswith('image_encoder.proj'): 
-        #     p.requires_grad = True
-        if 'adaptermlp' in n or "prompt_learner" in n:
-            p.requires_grad = True
-        else: 
+    else:
+        for p in upt.detector.parameters():
             p.requires_grad = False
-    
-    for n, p in upt.named_parameters():
-        if p.requires_grad:
-            print(n)
 
-    if args.frozen_classifier != None:
-        frozen_name_lst = []
-        if 'HO' in args.frozen_classifier:
-            frozen_name_lst.append('adapter_HO')
-        if 'U' in args.frozen_classifier:
-            frozen_name_lst.append('adapter_U')
-        if 'T' in args.frozen_classifier:
-            frozen_name_lst.append('adapter_union_weight')
+        for n, p in upt.clip_head.named_parameters():
+            if 'adaptermlp' in n or "prompt_learner" in n:
+                p.requires_grad = True
+            else: 
+                p.requires_grad = False
         
         for n, p in upt.named_parameters():
-            if 'clip_head' in n or 'detector' in n:
-                continue
-            if n.split('.')[0] in frozen_name_lst:
-                p.requires_grad = False
-    
-    if args.label_learning:
-        for n, p in upt.named_parameters():
-            if 'clip_head' in n or 'detector' in n:
-                continue
-            if 'label_' in n:
-                p.requires_grad = True
+            if p.requires_grad:
+                print(n)
+
+        if args.frozen_classifier != None:
+            frozen_name_lst = []
+            if 'HO' in args.frozen_classifier:
+                frozen_name_lst.append('adapter_HO')
+            if 'U' in args.frozen_classifier:
+                frozen_name_lst.append('adapter_U')
+            if 'T' in args.frozen_classifier:
+                frozen_name_lst.append('adapter_union_weight')
             
-    others = [n for n, p in upt.named_parameters()
-                    if p.requires_grad and 'clip_head' not in n]
+            for n, p in upt.named_parameters():
+                if 'clip_head' in n or 'detector' in n:
+                    continue
+                if n.split('.')[0] in frozen_name_lst:
+                    p.requires_grad = False
+        
+        if args.label_learning:
+            for n, p in upt.named_parameters():
+                if 'clip_head' in n or 'detector' in n:
+                    continue
+                if 'label_' in n:
+                    p.requires_grad = True
+                
+        others = [n for n, p in upt.named_parameters()
+                        if p.requires_grad and 'clip_head' not in n]
 
-    param_dicts = [
-        {
-            "params": [p for n, p in upt.clip_head.named_parameters()
-                    if p.requires_grad]
-        },
-        { ## others
-            "params": [p for n, p in upt.named_parameters()
-                    if p.requires_grad and 'clip_head' not in n],
-            "lr": args.lr_head,
-        },
-    ]
-    
-    # print([n for n, p in upt.named_parameters()
-    #     if p.requires_grad])
-    n_parameters = sum(p.numel() for p in upt.parameters() if p.requires_grad)
-    print('number of trainable params:', n_parameters, f'{n_parameters/1e6:.3f}M')
+        param_dicts = [
+            {
+                "params": [p for n, p in upt.clip_head.named_parameters()
+                        if p.requires_grad]
+            },
+            { ## others
+                "params": [p for n, p in upt.named_parameters()
+                        if p.requires_grad and 'clip_head' not in n],
+                "lr": args.lr_head,
+            },
+        ]
+        
+        n_parameters = sum(p.numel() for p in upt.parameters() if p.requires_grad)
+        print('number of trainable params:', n_parameters, f'{n_parameters/1e6:.3f}M')
 
-    n_parameters = sum(p.numel() for p in upt.parameters())
-    print('number of all params:', n_parameters, f'{n_parameters/1e6:.3f}M')
+        n_parameters = sum(p.numel() for p in upt.parameters())
+        print('number of all params:', n_parameters, f'{n_parameters/1e6:.3f}M')
 
-    optim = torch.optim.AdamW(
-        param_dicts, lr=args.lr_vit,
-        weight_decay=args.weight_decay
-    )
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optim, args.lr_drop)
-    if args.resume:
-        optim.load_state_dict(checkpoint['optim_state_dict'])
-        lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        epoch=checkpoint['epoch']
-        iteration = checkpoint['iteration']
-        scaler = torch.cuda.amp.GradScaler(enabled=True)
-        scaler.load_state_dict(checkpoint['scaler_state_dict'])
-    # Override optimiser and learning rate scheduler
-        engine.update_state_key(optimizer=optim, lr_scheduler=lr_scheduler, epoch=epoch,iteration=iteration, scaler=scaler)
-    else:
-        engine.update_state_key(optimizer=optim, lr_scheduler=lr_scheduler)
-    # with torch.autograd.set_detect_anomaly(True):
+        optim = torch.optim.AdamW(
+            param_dicts, lr=args.lr_vit,
+            weight_decay=args.weight_decay
+        )
+        lr_scheduler = torch.optim.lr_scheduler.StepLR(optim, args.lr_drop)
+        if args.resume:
+            optim.load_state_dict(checkpoint['optim_state_dict'])
+            lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            epoch=checkpoint['epoch']
+            iteration = checkpoint['iteration']
+            scaler = torch.cuda.amp.GradScaler(enabled=True)
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        # Override optimiser and learning rate scheduler
+            # engine.update_state_key(optimizer=optim, lr_scheduler=lr_scheduler, epoch=epoch,iteration=iteration, scaler=scaler)
+            engine.update_state_key(optimizer=optim, lr_scheduler=lr_scheduler, scaler=scaler)
+        else:
+            engine.update_state_key(optimizer=optim, lr_scheduler=lr_scheduler)
+        # with torch.autograd.set_detect_anomaly(True):
 
-    import json
-    with open(os.path.join(args.output_dir, 'args.txt'), 'w') as f:
-        json.dump(args.__dict__, f, indent=2)
-    f.close()
+        import json
+        with open(os.path.join(args.output_dir, 'args.txt'), 'w') as f:
+            json.dump(args.__dict__, f, indent=2)
+        f.close()
 
-    engine(args.epochs)
+        engine(args.epochs)
+        print('Training done')
 
 @torch.no_grad()
 def sanity_check(args):
@@ -434,7 +411,8 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', default='hicodet', type=str)
     parser.add_argument('--partitions', nargs='+', default=['train2015', 'test2015'], type=str)
     parser.add_argument('--num-workers', default=2, type=int)
-    parser.add_argument('--data-root', default='./hicodet')
+    parser.add_argument('--data-root', default='hicodet')
+    parser.add_argument('--image-path', default='hico_20160224_det/images')
 
     # training parameters
     parser.add_argument('--device', default='cuda',
@@ -582,6 +560,11 @@ if __name__ == '__main__':
     parser.add_argument('--giou_loss_coef', default=2, type=float)
     parser.add_argument('--focal_alpha', default=0.25, type=float)
     ## **************** arguments for deformable detr **************** ##
+    parser.add_argument('--use_sam', action="store_true")
+    parser.add_argument('--cache_sam', action="store_true")
+    parser.add_argument('--cache_path', type=str, default="gta/pickle")
+    parser.add_argument('--sam_path', default="defaultPath")
+    parser.add_argument('--sam_coef', type=float, default=0.6)
     args = parser.parse_args()
     print(args)
 
@@ -597,3 +580,4 @@ if __name__ == '__main__':
         main(0,args)
     else:
         mp.spawn(main, nprocs=args.world_size, args=(args,))
+

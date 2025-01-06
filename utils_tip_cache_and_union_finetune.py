@@ -25,7 +25,9 @@ from torch.utils.data import Dataset
 
 from vcoco.vcoco import VCOCO
 from hicodet.hicodet import HICODet
-from hico_text_label import hico_unseen_index
+from gta.gta import GTA
+from hico_text_label import hico_unseen_index, hico_text_label, hico_obj_text_label
+from hico_list import hico_verb_object_list
 import sys
 sys.path.append('../pocket/pocket')
 import pocket
@@ -43,22 +45,71 @@ import clip
 from PIL import Image
 import time
 from fvcore.nn import FlopCountAnalysis, flop_count_table
+from torchvision.transforms import PILToTensor
+from torchvision.utils import save_image
+from torchvision.transforms.functional import to_pil_image
+from PIL import Image, ImageDraw, ImageFont
+
 
 def custom_collate(batch):
     images = []
     targets = []
-    # images_clip = []
     
     for im, tar in batch:
         images.append(im)
         targets.append(tar)
-        
-        # images_clip.append(im_clip)
     return images, targets
 
+def draw_bounding_boxes(image, box_h, box_o, objects, verbs, mapping_obj, mapping_verb, src_size, dst_size, path):
+    """
+    Draws bounding boxes and labels on a given image.
+
+    Args:
+        image (torch.Tensor): The image tensor of shape (C, H, W) with values in [0, 1].
+        boxes (torch.Tensor): Bounding box tensor of shape (N, 4), where each box is [x_min, y_min, x_max, y_max].
+        labels (torch.Tensor): Labels tensor of shape (N,), containing the label for each bounding box.
+    """
+    
+    pil_image = to_pil_image(image)
+    draw = ImageDraw.Draw(pil_image)
+    font = ImageFont.load_default(size=35)
+    for bh, bo, obj, v in zip(box_h, box_o, objects, verbs):
+        obj = mapping_obj[obj.item()]
+        verb = mapping_verb[v.item()]
+        bh[..., [0, 2]] *= (dst_size[1] / src_size[1])
+        bh[..., [1, 3]] *= (dst_size[0] / src_size[0])
+        bo[..., [0, 2]] *= (dst_size[1] / src_size[1])
+        bo[..., [1, 3]] *= (dst_size[0] / src_size[0])
+        bh = bh.tolist()
+        bo = bo.tolist()
+        x_min, y_min, x_max, y_max = bh
+        draw.rectangle([x_min, y_min, x_max, y_max], outline="red", width=2)
+        x_min, y_min, x_max, y_max = bo
+        draw.rectangle([x_min, y_min, x_max, y_max], outline="blue", width=2)
+        text_bbox = draw.textbbox((x_min, y_min), obj, font=font)
+        text_width = text_bbox[2] - text_bbox[0]
+        text_height = text_bbox[3] - text_bbox[1]
+        draw.rectangle([x_min, y_min - text_height, x_min + text_width, y_min], fill="blue")
+        draw.text((x_min, y_min - text_height), obj, fill="white", font=font)
+
+        bh_center = ((bh[0]+bh[2])/2, (bh[1]+bh[3])/2)
+        bo_center = ((bo[0]+bo[2])/2, (bo[1]+bo[3])/2)
+        draw.line([bh_center, bo_center], width = 2, fill='red')
+        interaction = ((bh_center[0] + bo_center[0])/2, (bh_center[1] + bo_center[1])/2)
+        x_min, y_min = interaction[0], interaction[1]
+        text_bbox = draw.textbbox(interaction, verb, font=font)
+        text_width = text_bbox[2] - text_bbox[0]
+        text_height = text_bbox[3] - text_bbox[1]
+        draw.rectangle([x_min, y_min - text_height, x_min + text_width, y_min], fill="green")
+        draw.text((x_min, y_min - text_height), verb, fill="white", font=font)
+
+    
+    pil_image.save(path)
+
+
 class DataFactory(Dataset):
-    def __init__(self, name, partition, data_root, clip_model_name, zero_shot=False, zs_type='rare_first', num_classes=600, detr_backbone="R50"): ##ViT-B/16, ViT-L/14@336px
-        if name not in ['hicodet', 'vcoco']:
+    def __init__(self, name, partition, data_root, image_path, clip_model_name, zero_shot=False, zs_type='rare_first', num_classes=600, detr_backbone="R50"): ##ViT-B/16, ViT-L/14@336px
+        if name not in ['hicodet', 'gta', 'vcoco']:
             raise ValueError("Unknown dataset ", name)
         assert clip_model_name in ['ViT-L/14@336px', 'ViT-B/16', 'ViT-L/14'], "Unknown CLIP model " + clip_model_name
         self.clip_model_name = clip_model_name
@@ -68,13 +119,18 @@ class DataFactory(Dataset):
             self.clip_input_resolution = 336
         
         if name == 'hicodet':
-            assert partition in ['train2015', 'test2015'], \
-                "Unknown HICO-DET partition " + partition
             self.dataset = HICODet(
-                root=os.path.join(data_root, 'hico_20160224_det/images', partition),
+                root=os.path.join(data_root, image_path, partition),
                 anno_file=os.path.join(data_root, 'instances_{}.json'.format(partition)),
                 target_transform=pocket.ops.ToTensor(input_format='dict')
             )
+        elif name == "gta":
+            self.dataset = GTA(
+                root=os.path.join(data_root, image_path, partition),
+                anno_file=os.path.join(data_root, 'instances_{}.json'.format(partition)),
+                target_transform=pocket.ops.ToTensor(input_format='dict')
+            )
+            assert not zero_shot
         else:
             assert partition in ['train', 'val', 'trainval', 'test'], \
                 "Unknown V-COCO partition " + partition
@@ -129,8 +185,6 @@ class DataFactory(Dataset):
             self.filtered_hoi_idx = hico_unseen_index[self.zs_type]
 
         device = "cuda"
-        # _, self.process = clip.load('ViT-B/16', device=device)
-        print(self.clip_model_name)
         _, self.process = clip.load(self.clip_model_name, device=device)
 
         self.keep = [i for i in range(len(self.dataset))]
@@ -141,8 +195,6 @@ class DataFactory(Dataset):
 
             for i in self.keep:
                 (image, target), filename = self.dataset[i]
-                # if 1 in target['hoi']:
-                #     pdb.set_trace()
                 mutual_hoi = set(self.remain_hoi_idx) & set([_h.item() for _h in target['hoi']])
                 if len(mutual_hoi) != 0:
                     self.zs_keep.append(i)
@@ -161,17 +213,14 @@ class DataFactory(Dataset):
         
     def __len__(self):
         return len(self.keep)
-        return len(self.dataset)
 
     # train detr with roi
     def __getitem__(self, i):
         (image, target), filename = self.dataset[self.keep[i]]
-        # (image, target), filename = self.dataset[i]
         if self.name == 'hicodet' and self.zero_shot and self.partition == 'train2015':
             _boxes_h, _boxes_o, _hoi, _object, _verb = [], [], [], [], []
             for j, hoi in enumerate(target['hoi']):
                 if hoi in self.filtered_hoi_idx:
-                    # pdb.set_trace()
                     continue
                 _boxes_h.append(target['boxes_h'][j])
                 _boxes_o.append(target['boxes_o'][j])
@@ -185,8 +234,7 @@ class DataFactory(Dataset):
             target['verb'] = torch.stack(_verb)
         w,h = image.size
         target['orig_size'] = torch.tensor([h,w])
-
-        if self.name == 'hicodet':
+        if self.name in ['hicodet', 'gta']:
             target['labels'] = target['verb']
             # Convert ground truth boxes to zero-based index and the
             # representation from pixel indices to coordinates
@@ -196,23 +244,14 @@ class DataFactory(Dataset):
             target['labels'] = target['actions']
             target['object'] = target.pop('objects')
             ## TODO add target['hoi']
-        
+
+        image_original = image
         image, target = self.transforms(image, target)
         image_clip, target = self.clip_transforms(image, target)  
         image, _ = self.normalize(image, None)
         image_clip, target = self.normalize(image_clip, target)
         target['filename'] = filename
-        return (image,image_clip), target
-        image_0, target_0 = self.transforms[0](image, target)
-        image, _ = self.transforms[1](image_0, None)
-        # pdb.set_trace()
-        target_0['valid_size'] = torch.as_tensor(image.shape[-2:])
-        # pdb.set_trace()
-        image_clip, target = self.transforms[3](image_0, target_0) # resize 
-        image_clip, target = self.transforms[2](image_clip, target) # normlize
-        if image_0.size[-1] >1344 or image_0.size[-2] >1344:print(image_0.size)
-        target['filename'] = filename
-        return (image,image_clip), target
+        return (image,image_clip, PILToTensor()(image_original).to(image.device)/255), target
 
     def expand2square(self, pil_img, background_color):
         width, height = pil_img.size
@@ -232,8 +271,6 @@ class DataFactory(Dataset):
         min_instances = 3
         max_instances = 15
         region_props = []
-        # for res in results:
-        # pdb.set_trace()
         bx = results['ex_bbox']
         sc = results['ex_scores']
         lb = results['ex_labels']
@@ -285,11 +322,6 @@ class DataFactory(Dataset):
         # Skip image when there are no valid human-object pairs
         if n_h == 0 or n <= 1:
             print(n_h, n)
-            # boxes_h_collated.append(torch.zeros(0, device=device, dtype=torch.int64))
-            # boxes_o_collated.append(torch.zeros(0, device=device, dtype=torch.int64))
-            # object_class_collated.append(torch.zeros(0, device=device, dtype=torch.int64))
-            # prior_collated.append(torch.zeros(2, 0, self.num_classes, device=device))
-            # continue
 
         # Get the pairwise indices
         x, y = torch.meshgrid(
@@ -319,13 +351,6 @@ class DataFactory(Dataset):
         union_boxes[:,2].clamp_(0, image_w)
         union_boxes[:,3].clamp_(0, image_h)
     
-        # region_props.append(dict(
-        #     boxes=bx[keep],
-        #     scores=sc[keep],
-        #     labels=lb[keep],
-        #     hidden_states=hs[keep],
-        #     mask = ms[keep]
-        # ))
 
         # return sub_boxes.int(), obj_boxes.int(), union_boxes.int()
         return sub_boxes, obj_boxes, union_boxes
@@ -369,32 +394,60 @@ def get_flop_stats(model, data_loader):
     return flops
 
 def _get_model_analysis_input(data_loader):
-    device = torch.device("cuda")
     for batch in data_loader:
         inputs = pocket.ops.relocate_to_cuda(batch[0])
         inputs = (inputs,batch[1])
         return inputs
 
-from torch.cuda import amp
 class CustomisedDLE(DistributedLearningEngine):
     def __init__(self, net, dataloader, max_norm=0, num_classes=117, **kwargs):
         super().__init__(net, None, dataloader, **kwargs)
         self.max_norm = max_norm
         self.num_classes = num_classes
-        # self.scaler = amp.GradScaler(enabled=True)
+
+        if net.dataset == "hicodet":
+            objs = list(map(lambda s:s.replace("a photo of a ", "").replace("a photo of an ", "").replace("a photo of ", ""), [obj[1] for obj in hico_obj_text_label]))
+            objs.remove("nothing")
+            self.verbs = list(map(lambda k:k[0], hico_verb_object_list))
+        elif net.dataset == "gta":
+            from gta.gta_to_hico import object_list, valid_interactions
+            objs = object_list
+            self.verbs = list(map(lambda k:k[0], valid_interactions))
+        else:
+            raise NotImplementedError
+        
+        text_to_idx = {val:i for i, val in enumerate(objs)}
+        self.idx_to_text = {val:key for key, val in text_to_idx.items()}
+
+        self._net = net
+
+
     def _on_each_iteration(self):
-        # with amp.autocast(enabled=True):
-        loss_dict = self._state.net(
-            *self._state.inputs, targets=self._state.targets)
+        loss_dict = self._state.net(*self._state.inputs, targets=self._state.targets)
         if loss_dict['interaction_loss'].isnan():
             raise ValueError(f"The HOI loss is NaN for rank {self._rank}")
-
+        
         self._state.loss = sum(loss for loss in loss_dict.values())
         self._state.optimizer.zero_grad(set_to_none=True)
         self._state.loss.backward()
         if self.max_norm > 0:
             torch.nn.utils.clip_grad_norm_(self._state.net.parameters(), self.max_norm)
         self._state.optimizer.step()
+        
+        total_iter = len(self._train_loader.dataset)
+        print(f"Epoch {self._state.epoch} : {self._state.iteration % total_iter} / {total_iter}", end=f"      \r")
+
+       
+    @torch.no_grad()
+    def sam_cache(self, dataloader, save_root):
+        dataset = dataloader.dataset.dataset
+        
+        for iteration, batch in tqdm(enumerate(dataloader), total=len(dataset), desc="caching..."):
+            inputs = pocket.ops.relocate_to_cuda(batch[0])
+            boxes, confidences, labels = self._net.cache_sam(inputs,batch[1])
+            name = batch[1][0]['filename'][:-4]
+            with open(os.path.join(save_root, name+".pkl"), "wb") as f:
+                pickle.dump([boxes, confidences, labels], f)
 
     @torch.no_grad()
     def test_hico(self, dataloader, args=None):
@@ -402,7 +455,6 @@ class CustomisedDLE(DistributedLearningEngine):
         net.eval()
 
         dataset = dataloader.dataset.dataset
-        interaction_to_verb = torch.as_tensor(dataset.interaction_to_verb)
 
         associate = BoxPairAssociation(min_iou=0.5)
         conversion = torch.from_numpy(np.asarray(
@@ -410,28 +462,32 @@ class CustomisedDLE(DistributedLearningEngine):
         ))
         if args.dataset == "hicodet":
             tgt_num_classes = 600
+        elif args.dataset == "gta":
+            tgt_num_classes = 12
+        else:
+            raise NotImplementedError
 
-        
-        num_gt = dataset.anno_interaction if args.dataset == "hicodet" else None
+        num_gt = dataset.anno_interaction if args.dataset in ["hicodet", "gta"] else None
         meter = DetectionAPMeter(
             tgt_num_classes, nproc=1,
             num_gt=num_gt,
             algorithm='11P'
         )
         total_times = []
-        for batch in tqdm(dataloader):
+        for iteration, batch in tqdm(enumerate(dataloader), total=len(dataset)):
             inputs = pocket.ops.relocate_to_cuda(batch[0])
             time_start = time.time()
-            ## get flops using fvcore
-            # get_flop_stats(net, dataloader)
             outputs = net(inputs,batch[1])
+            # debug
+            if outputs is not None:
+                src_size = outputs[0]['src_size'].tolist()
+                dst_size = outputs[0]['dst_size']
+                sam = outputs[0]['sam']
             time_end = time.time()
             total_times.append(time_end - time_start)
             # Skip images without detections
             if outputs is None or len(outputs) == 0:
                 continue
-            # # Batch size is fixed as 1 for inference
-            # assert len(output) == 1, f"Batch size is not 1 but {len(outputs)}."
             for output, target in zip(outputs, batch[-1]):
                 output = pocket.ops.relocate_to_cpu(output, ignore=True)
                 # Format detections
@@ -440,20 +496,16 @@ class CustomisedDLE(DistributedLearningEngine):
                 objects = output['objects']
                 scores = output['scores']
                 verbs = output['labels']
-
                 if net.module.num_classes==117 or net.module.num_classes==407:
                     interactions = conversion[objects, verbs]
                 else:
                     interactions = verbs
-
                 # Recover target box scale
                 gt_bx_h = net.module.recover_boxes(target['boxes_h'], target['size'])
                 gt_bx_o = net.module.recover_boxes(target['boxes_o'], target['size'])
                 # Associate detected pairs with ground truth pairs
                 labels = torch.zeros_like(scores)
                 unique_hoi = interactions.unique()
-                if len(labels) == 0:
-                    pdb.set_trace()
                 for hoi_idx in unique_hoi:
                     gt_idx = torch.nonzero(target['hoi'] == hoi_idx).squeeze(1)
                     det_idx = torch.nonzero(interactions == hoi_idx).squeeze(1)
@@ -465,9 +517,15 @@ class CustomisedDLE(DistributedLearningEngine):
                             boxes_o[det_idx].view(-1, 4)),
                             scores[det_idx].view(-1)
                         )
-                        # all_det_idxs.append(det_idx)
+                
+                # debug
+                # if outputs is not None and (labels==1).sum() > 0:
+                #     exp_name = "sam" if sam else "orig"
+                #     draw_bounding_boxes(outputs[0]["image"], boxes_h[labels==1], boxes_o[labels==1], objects[labels==1], interactions[labels==1].long(), self.idx_to_text, self.verbs, src_size, dst_size, f"log/gta/{exp_name}/{'%05d'% iteration}.png")
+
+                
+                # draw_bounding_boxes(outputs[0]["image"], boxes_h[labels==1], boxes_o[labels==1], objects[labels==1], interactions[labels==1].long(), self.idx_to_text, self.verbs, src_size, dst_size, f"log/{args.dataset}/{'%05d'% iteration}.png")
                 meter.append(scores, interactions, labels)   # scores human*object*verb, interaction（600), labels
-        
         time_sum = 0
         for i in total_times:
             time_sum += i

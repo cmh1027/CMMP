@@ -1,4 +1,5 @@
-hico_verb_object_list = [('board', 'airplane'),
+hico_verb_object_list = \
+[('board', 'airplane'),
  ('direct', 'airplane'),
  ('exit', 'airplane'),
  ('fly', 'airplane'),

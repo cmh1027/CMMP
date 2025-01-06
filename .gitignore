@@ -1,0 +1,7 @@
+hicodet
+hicodet_pkl_files
+vcoco_pkl_files
+gta
+log
+*.pyc
+__pycache__

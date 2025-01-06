@@ -24,14 +24,9 @@ import sys
 from hico_list import hico_verb_object_list,hico_verbs,hico_verbs_sentence,hico_verbs_sentence_2
 from vcoco_list import vcoco_verbs_sentence
 sys.path.append('detr')
-# print(sys.path)
 from detr.models import build_model
-# from d_detr.models import build_model as build_model_d_detr
 from util import box_ops
 from util.misc import nested_tensor_from_tensor_list
-import pdb
-# from CLIP_models import CLIP_ResNet, tokenize
-# from CLIP_models_adapter_prior2 import CLIP_ResNet, tokenize, CLIP
 import CLIP_models_adapter_prior2
 import torchvision
 from collections import OrderedDict
@@ -43,12 +38,71 @@ import clip
 from ops import box_xyxy_to_cxcywh, box_cxcywh_to_xyxy
 import pickle, random
 from tqdm import tqdm
-from torch.cuda import amp
-# from sklearn.cluster import KMeans
-# from sklearn.metrics import silhouette_score
 from hico_text_label import hico_unseen_index
 import hico_text_label
 from HICO_utils import HOI_IDX_TO_ACT_IDX
+from torchvision.utils import save_image
+from torchvision.transforms.functional import to_pil_image
+from PIL import Image, ImageDraw, ImageFont
+from gta.gta_to_hico import gta_text_label
+import sys
+
+def create_sam_detector(sam_path):
+    sys.path.append(sam_path)
+    import os
+    import torch
+    from sam2.build_sam import build_sam2
+    from sam2.sam2_image_predictor import SAM2ImagePredictor
+    from grounding_dino.groundingdino.util.inference import load_model
+    SAM2_CHECKPOINT = os.path.join(sam_path, "checkpoints/sam2.1_hiera_large.pt")
+    SAM2_MODEL_CONFIG = os.path.join("/" + os.path.dirname(os.path.realpath(__file__)), "sam2/configs/sam2.1/sam2.1_hiera_l.yaml")
+    GROUNDING_DINO_CONFIG = os.path.join(sam_path, "grounding_dino/groundingdino/config/GroundingDINO_SwinT_OGC.py")
+    GROUNDING_DINO_CHECKPOINT = os.path.join(sam_path, "gdino_checkpoints/groundingdino_swint_ogc.pth")
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # build SAM2 image predictor
+    sam2_checkpoint = SAM2_CHECKPOINT
+    model_cfg = SAM2_MODEL_CONFIG
+    sam2_model = build_sam2(model_cfg, sam2_checkpoint, device=DEVICE)
+    sam2_predictor = SAM2ImagePredictor(sam2_model)
+
+    # build grounding dino model
+    grounding_model = load_model(
+        model_config_path=GROUNDING_DINO_CONFIG, 
+        model_checkpoint_path=GROUNDING_DINO_CHECKPOINT,
+        device=DEVICE
+    )
+    return grounding_model, sam2_predictor
+
+
+def draw_bounding_boxes(image: torch.Tensor, boxes: torch.Tensor, labels: torch.Tensor, mapping: list, src_size, dst_size, path: str):
+    """
+    Draws bounding boxes and labels on a given image.
+
+    Args:
+        image (torch.Tensor): The image tensor of shape (C, H, W) with values in [0, 1].
+        boxes (torch.Tensor): Bounding box tensor of shape (N, 4), where each box is [x_min, y_min, x_max, y_max].
+        labels (torch.Tensor): Labels tensor of shape (N,), containing the label for each bounding box.
+    """
+    pil_image = to_pil_image(image)
+    draw = ImageDraw.Draw(pil_image)
+    font = ImageFont.load_default(size=25)
+    boxes[..., [0, 2]] *= (dst_size[1] / src_size[1])
+    boxes[..., [1, 3]] *= (dst_size[0] / src_size[0])
+    
+    # Iterate through each bounding box and label
+    for box, label in zip(boxes, labels):
+        x_min, y_min, x_max, y_max = box.tolist()
+        draw.rectangle([x_min, y_min, x_max, y_max], outline="red", width=2)
+        text = str(mapping[label.item()])
+
+        text_bbox = draw.textbbox((x_min, y_min), text, font=font)
+        text_width = text_bbox[2] - text_bbox[0]
+        text_height = text_bbox[3] - text_bbox[1]
+        draw.rectangle([x_min, y_min - text_height, x_min + text_width, y_min], fill="red")
+        draw.text((x_min, y_min - text_height), text, fill="white", font=font)
+    pil_image.save(path)
+
 
 _tokenizer = _Tokenizer()
 class MLP(nn.Module):
@@ -108,9 +162,6 @@ class PromptLearner(nn.Module):
         ctx_init = args.CTX_INIT ## cfg.TRAINER.COOP.CTX_INIT
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
-        # clip_imsize = clip_model.visual.input_resolution
-        # cfg_imsize = cfg.INPUT.SIZE[0]
-        # assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
         if ctx_init:
             # use given words to initialize context vectors
@@ -292,6 +343,8 @@ class UPT(nn.Module):
         min_instances: int = 3, max_instances: int = 15,
         object_class_to_target_class: List[list] = None,
         object_n_verb_to_interaction: List[list] = None,
+        use_sam: bool = False,
+        sam_cache: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -349,9 +402,11 @@ class UPT(nn.Module):
         self.seen_verb_idxs = list(set([HOI_IDX_TO_ACT_IDX[idx] for idx in range(600) if idx not in self.filtered_hoi_idx]))
         self.label_choice = args.label_choice
         if 'HO' in self.logits_type:
+            breakpoint()
             self.cache_model_HO, self.one_hots_HO, self.sample_lens_HO = self.load_cache_model(file1=file1, feature='hum_obj',num_classes=self.num_classes, num_shot=num_shot, filtered_hoi_idx = self.filtered_hoi_idx, use_multi_hot=self.use_multi_hot, label_choice=self.label_choice, num_anno=self.num_anno)
             self.cache_model_HO, self.one_hots_HO, self.sample_lens_HO  = self.cache_model_HO.cuda().float(), self.one_hots_HO.cuda().float(), self.sample_lens_HO.cuda().float()
         if 'U' in self.logits_type:
+            breakpoint()
             self.cache_model_U, self.one_hots_U, self.sample_lens_U = self.load_cache_model(file1=file1, feature='uni',num_classes=self.num_classes, num_shot=num_shot, filtered_hoi_idx = self.filtered_hoi_idx, use_multi_hot=self.use_multi_hot, label_choice=self.label_choice, num_anno=self.num_anno)
             self.cache_model_U, self.one_hots_U, self.sample_lens_U = self.cache_model_U.cuda().float(), self.one_hots_U.cuda().float(), self.sample_lens_U.cuda().float()
 
@@ -451,47 +506,6 @@ class UPT(nn.Module):
         if args.prior_method == 4: #CoCoOp
             self.priors_downproj = MLP(512, 512, 512, 1)
 
-        self.no_interaction_indexes = [9, 23, 30, 45, 53, 64, 75, 85, 91, 95, 106, 110, 128, 145, 159, 169, 173, 185, 193, 197, 207, 213, 223, 231, 234, 238, 242, 246, 251, 256, 263, 272, 282, 289, 294, 304, 312, 324, 329, 335, 341, 347, 351, 355, 362, 367, 375, 382, 388, 392, 396, 406, 413, 417, 428, 433, 437, 444, 448, 452, 462, 473, 482, 487, 501, 505, 515, 527, 532, 537, 545, 549, 557, 561, 566, 575, 583, 587, 594, 599]
-        self.HOI_IDX_TO_OBJ_IDX = [
-                4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 14,
-                14, 14, 14, 14, 14, 14, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 39,
-                39, 39, 39, 39, 39, 39, 39, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 2, 2, 2, 2, 2,
-                2, 2, 2, 2, 2, 2, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 56, 56, 56, 56,
-                56, 56, 57, 57, 57, 57, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 60, 60,
-                60, 60, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
-                16, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 3,
-                3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 58,
-                58, 58, 58, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 6, 6, 6, 6, 6,
-                6, 6, 6, 62, 62, 62, 62, 47, 47, 47, 47, 47, 47, 47, 47, 47, 47, 24, 24,
-                24, 24, 24, 24, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 34, 34, 34, 34, 34,
-                34, 34, 34, 35, 35, 35, 21, 21, 21, 21, 59, 59, 59, 59, 13, 13, 13, 13, 73,
-                73, 73, 73, 73, 45, 45, 45, 45, 45, 50, 50, 50, 50, 50, 50, 50, 55, 55, 55,
-                55, 55, 55, 55, 55, 55, 51, 51, 51, 51, 51, 51, 51, 51, 51, 51, 67, 67, 67,
-                67, 67, 67, 67, 74, 74, 74, 74, 74, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41,
-                54, 54, 54, 54, 54, 54, 54, 54, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20,
-                20, 10, 10, 10, 10, 10, 42, 42, 42, 42, 42, 42, 29, 29, 29, 29, 29, 29, 23,
-                23, 23, 23, 23, 23, 78, 78, 78, 78, 26, 26, 26, 26, 52, 52, 52, 52, 52, 52,
-                52, 66, 66, 66, 66, 66, 33, 33, 33, 33, 33, 33, 33, 33, 43, 43, 43, 43, 43,
-                43, 43, 63, 63, 63, 63, 63, 63, 68, 68, 68, 68, 64, 64, 64, 64, 49, 49, 49,
-                49, 49, 49, 49, 49, 49, 49, 69, 69, 69, 69, 69, 69, 69, 12, 12, 12, 12, 53,
-                53, 53, 53, 53, 53, 53, 53, 53, 53, 53, 72, 72, 72, 72, 72, 65, 65, 65, 65,
-                48, 48, 48, 48, 48, 48, 48, 76, 76, 76, 76, 71, 71, 71, 71, 36, 36, 36, 36,
-                36, 36, 36, 36, 36, 36, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 31, 31,
-                31, 31, 31, 31, 31, 31, 31, 44, 44, 44, 44, 44, 32, 32, 32, 32, 32, 32, 32,
-                32, 32, 32, 32, 32, 32, 32, 11, 11, 11, 11, 28, 28, 28, 28, 28, 28, 28, 28,
-                28, 28, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 77, 77, 77, 77, 77,
-                38, 38, 38, 38, 38, 27, 27, 27, 27, 27, 27, 27, 27, 70, 70, 70, 70, 61, 61,
-                61, 61, 61, 61, 61, 61, 79, 79, 79, 79, 9, 9, 9, 9, 9, 7, 7, 7, 7, 7, 7, 7,
-                7, 7, 25, 25, 25, 25, 25, 25, 25, 25, 75, 75, 75, 75, 40, 40, 40, 40, 40,
-                40, 40, 22, 22, 22, 22, 22
-            ]
-        self.obj_to_no_interaction = torch.as_tensor([169, 23, 75, 159, 9, 64, 193, 575, 45, 566, 329, 505, 417, 246,
-                                                        30,  85, 128, 145, 185, 106, 324, 238, 599, 347, 213, 583, 355, 545,
-                                                        515, 341, 473, 482, 501, 375, 231, 234, 462, 527, 537,  53, 594, 304,
-                                                        335, 382, 487, 256, 223, 207, 444, 406, 263, 282, 362, 428, 312, 272,
-                                                        91,  95, 173, 242, 110, 557, 197, 388, 396, 437, 367, 289, 392, 413,
-                                                        549, 452, 433, 251, 294, 587, 448, 532, 351, 561])
-
         self.epoch = 0
         # self.use_deformable_attn = args.use_deformable_attn
         self.COCO_CLASSES = ['N/A', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat', 'traffic light', \
@@ -533,7 +547,29 @@ class UPT(nn.Module):
             clip_state_dict = torch.load("checkpoints/pretrained_clip/ViT-B-16.pt", map_location="cpu").state_dict()
             self.origin_clip_head = CLIP_models_adapter_prior2.build_model(state_dict=clip_state_dict, use_adapter=False)
         self.use_text_adapter = args.use_text_adapter
-    
+        self.use_sam = use_sam
+        if sam_cache:
+            assert args.use_sam
+            sam_path = kwargs["sam_path"]
+            self.sam_coef = kwargs["sam_coef"]
+            sys.path.append(sam_path)
+            from grounding_dino.groundingdino.util.inference import load_image_cmmp, predict
+            self.load_image_sam = load_image_cmmp
+            self.predict_sam = predict
+            self.sam_detector, self.sam_predictor = create_sam_detector(kwargs["sam_path"])
+        if self.dataset == "hicodet":
+            self.obj_list = list(map(lambda s:s.replace("a photo of a ", "").replace("a photo of an ", "").replace("a photo of ", ""), [obj[1] for obj in hico_text_label.hico_obj_text_label]))
+            self.obj_list.remove("nothing")
+        elif self.dataset == "gta":
+            from gta.gta_to_hico import object_list
+            self.obj_list = object_list
+        else:
+            raise NotImplementedError
+        self.sam_text = ". ".join(self.obj_list)
+        self.text_to_idx = {val:i for i, val in enumerate(self.obj_list)}
+        self.idx_to_text = {val:key for key, val in self.text_to_idx.items()}
+        self.idx_temp = 0
+
     @torch.no_grad()
     def refresh_unseen_verb_cache_mem(self, ):
         assert self.num_classes == 117
@@ -738,8 +774,7 @@ class UPT(nn.Module):
         s_o = scores[y].pow(p)
         # Map object class index to target class index
         # Object class index to target class index is a one-to-many mapping 
-        target_cls_idx = [self.object_class_to_target_class[obj.item()]
-            for obj in object_class[y]]
+        target_cls_idx = [self.object_class_to_target_class[obj.item()] for obj in object_class[y]]
         # Duplicate box pair indices for each target class
         pair_idx = [i for i, tar in enumerate(target_cls_idx) for _ in tar]
         # Flatten mapped target indices
@@ -771,8 +806,10 @@ class UPT(nn.Module):
 
     def compute_roi_embeddings(self, features: OrderedDict, image_size: Tensor, region_props: List[dict], feat_global):
         device = features.device
-        boxes_h_collated = []; boxes_o_collated = []
-        prior_collated = []; object_class_collated = []
+        boxes_h_collated = []
+        boxes_o_collated = []
+        prior_collated = []
+        object_class_collated = []
         # pairwise_tokens_collated = []
         attn_maps_collated = []
         all_logits = []
@@ -808,8 +845,9 @@ class UPT(nn.Module):
             scores = props['scores']
             labels = props['labels']
 
-            is_human = labels == self.human_idx
-            n_h = torch.sum(is_human); n = len(boxes)
+            is_human = (labels == self.human_idx)
+            n_h = torch.sum(is_human)
+            n = len(boxes)
             # Permute human instances to the top
             if not torch.all(labels[:n_h]==self.human_idx):
                 h_idx = torch.nonzero(is_human).squeeze(1)
@@ -830,12 +868,16 @@ class UPT(nn.Module):
                 torch.arange(n, device=device),
                 torch.arange(n, device=device)
             )
-            # Valid human-object pairs
-            x_keep, y_keep = torch.nonzero(torch.logical_and(x != y, x < n_h)).unbind(1)
+            # Valid human-object pairs (x => y)
+            if self.dataset == "gta":
+                x_keep, y_keep = torch.nonzero(x < n_h).unbind(1)
+            else:
+                x_keep, y_keep = torch.nonzero(torch.logical_and(x != y, x < n_h)).unbind(1)
             if len(x_keep) == 0:
                 # Should never happen, just to be safe
                 raise ValueError("There are no valid human-object pairs")
-            x = x.flatten(); y = y.flatten()
+            x = x.flatten()
+            y = y.flatten()
             
             # extract single roi features
             sub_boxes = boxes[x_keep]
@@ -845,8 +887,6 @@ class UPT(nn.Module):
             union_boxes = torch.cat([lt,rb],dim=-1)
             
             spatial_scale = 1 / (image_size[0,0]/local_features.shape[1])
-            # union_features = torchvision.ops.roi_align(local_features.unsqueeze(0),[union_boxes],output_size=(1, 1),spatial_scale=spatial_scale,aligned=True).flatten(2).mean(-1)
-            # single_features = torchvision.ops.roi_align(local_features.unsqueeze(0),[boxes],output_size=(1, 1),spatial_scale=spatial_scale,aligned=True).flatten(2).mean(-1)
             union_features = torchvision.ops.roi_align(local_features.unsqueeze(0),[union_boxes],output_size=(7, 7),spatial_scale=spatial_scale,aligned=True)
             single_features = torchvision.ops.roi_align(local_features.unsqueeze(0),[boxes],output_size=(7, 7),spatial_scale=spatial_scale,aligned=True)
 
@@ -856,9 +896,7 @@ class UPT(nn.Module):
             elif self.feat_mask_type == 1:
                 union_features = union_features.flatten(2).mean(-1)
                 single_features = single_features.flatten(2).mean(-1)
-            # 
-            # if self.box_proj == 1:
-            #     box_feat = self.box_proj_mlp(torch.cat((sub_boxes, obj_boxes), dim=-1))
+
             
             human_features = single_features[x_keep]
             object_features = single_features[y_keep]
@@ -967,9 +1005,7 @@ class UPT(nn.Module):
             boxes_h_collated.append(x_keep)
             boxes_o_collated.append(y_keep)
             object_class_collated.append(labels[y_keep])
-            prior_collated.append(self.compute_prior_scores(
-                x_keep, y_keep, scores, labels)
-            )
+            prior_collated.append(self.compute_prior_scores(x_keep, y_keep, scores, labels))
             all_logits.append(logits)
         
         if self.use_consistloss:
@@ -1006,7 +1042,7 @@ class UPT(nn.Module):
 
         return labels
 
-    def compute_interaction_loss(self, boxes, bh, bo, logits, prior, targets, gt_feats, pair_feats,): ### loss
+    def compute_interaction_loss(self, boxes, bh, bo, logits, prior, targets, gt_feats, pair_feats): ### loss
         ## bx, bo: indices of boxes
         labels = torch.cat([
             self.associate_with_ground_truth(bx[h], bx[o], target)
@@ -1021,27 +1057,22 @@ class UPT(nn.Module):
         
         prior = torch.cat(prior, dim=1).prod(0)
         x, y = torch.nonzero(prior).unbind(1)
-        num_one_label = torch.sum(labels)
         logits = torch.cat(logits) 
-        logits = logits[x, y]; prior = prior[x, y]; labels = labels[x, y]
+        logits = logits[x, y]
+        prior = prior[x, y]
+        labels = labels[x, y]
         
         n_p = len(torch.nonzero(labels))
-        # print("#(labels==1)", n_p)
         if n_p == 0:
             n_p = 1e9
-            print("!!!!!!!!!!!!! QUICK HACK!!!!!!!!!!!!!!!!!")
 
         if dist.is_initialized():
             world_size = dist.get_world_size()
             n_p = torch.as_tensor([n_p], device='cuda')
-            # n_p_distll = torch.as_tensor([n_p_distll], device='cuda')
             dist.barrier() 
             dist.all_reduce(n_p)
             n_p = (n_p / world_size).item()
 
-            # dist.all_reduce(n_p_distll)
-            # n_p_distll = (n_p_distll / world_size).item()
-            # n_p = (n_p.true_divide(world_size)).item()
         
         loss = binary_focal_loss_with_logits(
             torch.log(
@@ -1050,13 +1081,7 @@ class UPT(nn.Module):
             alpha=self.alpha, gamma=self.gamma
             )
         
-        if self.use_distill:
-            raise NotImplementedError
-            # loss_feat = F.l1_loss(pair_feats, gt_feats,reduction='sum')/gt_feats.shape[1]
-            loss_feat = torch.sum(3.0 - torch.diag(pair_feats @ gt_feats.t())) 
-            return loss  / n_p + max((1-self.epoch * 0.05), 0) * loss_feat / n_p_distll
-        else:
-            return loss / n_p
+        return loss / n_p
 
     def prepare_region_proposals(self, results): ## √ detr extracts the human-object pairs
         region_props = []
@@ -1105,7 +1130,7 @@ class UPT(nn.Module):
 
         return region_props
 
-    def postprocessing(self, boxes, bh, bo, logits, prior, objects, image_sizes): ### √
+    def postprocessing(self, boxes, bh, bo, logits, prior, objects, image_sizes, no_prior=False): ### √
         n = [len(b) for b in bh]
         logits = torch.cat(logits)
         logits = logits.split(n)
@@ -1117,10 +1142,13 @@ class UPT(nn.Module):
             pr = pr.prod(0)
             x, y = torch.nonzero(pr).unbind(1)
             scores = torch.sigmoid(lg[x, y])
-            
+            if no_prior:
+                _p = 1
+            else:
+                _p = pr[x, y]
             detections.append(dict(
                 boxes=bx, pairing=torch.stack([h[x], o[x]]),
-                scores=scores * pr[x, y], labels=y,
+                scores=scores * _p, labels=y,
                 objects=obj[x], size=size
             ))
 
@@ -1261,7 +1289,23 @@ class UPT(nn.Module):
                     tgt_ids.append(hoi_id)
         tgt_ids = torch.as_tensor(tgt_ids, dtype=torch.int64, device=device)
         return unique_hois
-    
+
+    def cache_sam(self, images, targets):
+        BOX_THRESHOLD = 0.5 * self.sam_coef
+        TEXT_THRESHOLD = 0.25 * self.sam_coef
+        images_noaug = [im[2] for im in images]
+        image_source, image = self.load_image_sam(images_noaug[0])
+        self.sam_predictor.set_image(image_source)
+        boxes, confidences, labels = self.predict_sam(
+            model=self.sam_detector,
+            image=image,
+            caption=self.sam_text,
+            box_threshold=BOX_THRESHOLD,
+            text_threshold=TEXT_THRESHOLD,
+        )
+        return boxes, confidences, labels
+
+
     def forward(self,
         images: List[Tensor],
         targets: Optional[List[dict]] = None
@@ -1298,30 +1342,60 @@ class UPT(nn.Module):
         batch_size = len(images)
         images_orig = [im[0].float() for im in images]
         images_clip = [im[1] for im in images]
+        images_noaug = [im[2] for im in images]
         device = images_clip[0].device
         image_sizes = torch.as_tensor([
             im.size()[-2:] for im in images_clip
         ], device=device)
-        image_sizes_orig = torch.as_tensor([
-            im.size()[-2:] for im in images_orig
-            ], device=device)
         
         if isinstance(images_orig, (list, torch.Tensor)):
             images_orig = nested_tensor_from_tensor_list(images_orig)
-        features, pos = self.detector.backbone(images_orig)
-        src, mask = features[-1].decompose()
-        # assert mask is not None2
-        hs, detr_memory = self.detector.transformer(self.detector.input_proj(src), mask, self.detector.query_embed.weight, pos[-1])
-        outputs_class = self.detector.class_embed(hs) # 6x8x100x81 or 6x8x100x92
-        outputs_coord = self.detector.bbox_embed(hs).sigmoid() # 6x8x100x4 
-        if self.dataset == 'vcoco' and outputs_class.shape[-1] == 92:
-            outputs_class = outputs_class[:, :, :, self.reserve_indices]
-            assert outputs_class.shape[-1] == 81, 'reserved shape NOT match 81'
-        
-        results = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
-        results = self.postprocessor(results, image_sizes)
+        if self.use_sam:
+            assert batch_size == 1
+            with open(os.path.join(f"gta/pickle/{self.dataset}", targets[0]['filename'][:-4] + ".pkl"), "rb") as f:
+                boxes, confidences, labels = pickle.load(f)
+            boxes = box_cxcywh_to_xyxy(boxes).to(image_sizes.device)
+            confidences = confidences.to(image_sizes.device)
+            img_h, img_w = image_sizes.unbind(1)
+            scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
+            boxes = boxes * scale_fct[:, None, :]
+            region_props = [{}]
+            box_list = []
+            score_list = []
+            label_list = []
+            for i, label_concat in enumerate(labels):
+                L = label_concat.split(" ")
+                for j in range(len(L)):
+                    if L[j] in self.text_to_idx:
+                        box_list.append(boxes[0][i])
+                        score_list.append(confidences[i])
+                        label_list.append(self.text_to_idx[L[j]])
+                    if j < len(L) - 1 and f"{L[j]} {L[j+1]}" in self.text_to_idx:
+                        box_list.append(boxes[0][i])
+                        score_list.append(confidences[i])
+                        label_list.append(self.text_to_idx[f"{L[j]} {L[j+1]}"])
+            if len(box_list) == 0:
+                print("No box", targets[0]['filename'])
+                return None
+            sorted_idx = torch.tensor(label_list).to(image_sizes.device).long().sort().indices
+            region_props[0]['boxes'] = torch.stack(box_list).to(image_sizes.device)[sorted_idx]
+            region_props[0]['scores'] = torch.tensor(score_list).to(image_sizes.device)[sorted_idx]
+            region_props[0]['labels'] = torch.tensor(label_list).to(image_sizes.device).long()[sorted_idx]
+        else:
+            features, pos = self.detector.backbone(images_orig)
+            src, mask = features[-1].decompose()
+            hs, _ = self.detector.transformer(self.detector.input_proj(src), mask, self.detector.query_embed.weight, pos[-1])
+            outputs_class = self.detector.class_embed(hs) # 6x8x100x81 or 6x8x100x92
+            outputs_coord = self.detector.bbox_embed(hs).sigmoid() # 6x8x100x4 
+            if self.dataset == 'vcoco' and outputs_class.shape[-1] == 92:
+                outputs_class = outputs_class[:, :, :, self.reserve_indices]
+                assert outputs_class.shape[-1] == 81, 'reserved shape NOT match 81'
+            results = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+            results = self.postprocessor(results, image_sizes)
+            region_props = self.prepare_region_proposals(results)
+        draw_bounding_boxes(images_noaug[0], region_props[0]['boxes'], region_props[0]['labels'], self.idx_to_text, image_sizes[0], images_noaug[0].shape[1:], f"log/bbox/{str(self.use_sam)}/{'%05d' % self.idx_temp}.png")
+        self.idx_temp += 1
 
-        region_props = self.prepare_region_proposals(results)
         priors = None
         if self.use_insadapter:
             priors = self.get_prior(region_props,image_sizes, self.prior_method) ## priors: (prior_feat, mask): (batch_size*14*64, batch_size*14)
@@ -1330,12 +1404,9 @@ class UPT(nn.Module):
             global_prior = self.priors_downproj_global(self.global_prior)
             global_prior = global_prior.unsqueeze(0).repeat(batch_size, 1, 1)
             prior_content = self.fusion_attn(tgt=priors[0].transpose(0, 1), memory=global_prior.transpose(0, 1))
-            # prior_content, _ = self.fusion_attn(priors[0].transpose(0, 1), global_prior.transpose(0, 1), global_prior.transpose(0, 1))
             prior_content = prior_content.transpose(0, 1)
             priors = (prior_content, priors[1])
-        # with amp.autocast(enabled=True):
         images_clip = nested_tensor_from_tensor_list(images_clip)
-        # 8x512, 8x512x14x14
         feat_global, feat_local = self.clip_head.image_encoder(images_clip.decompose()[0], priors)
         if self.use_mlp_proj:
             feat_local = feat_local.permute(0,2,3,1) # 8x14x14x512
@@ -1348,13 +1419,12 @@ class UPT(nn.Module):
             )
             return loss_dict
         
-        if self.use_consistloss:
+        if self.use_consistloss: # false
             logits, prior, bh, bo, objects, gt_feats, pair_feats, gt_all_logits = self.compute_roi_embeddings(feat_local, image_sizes, region_props)
         else:
             logits, prior, bh, bo, objects, gt_feats, pair_feats = self.compute_roi_embeddings(feat_local, image_sizes, region_props, feat_global)
-            gt_all_logits = None
         boxes = [r['boxes'] for r in region_props] 
-        
+
         if self.training:
             interaction_loss = self.compute_interaction_loss(boxes, bh, bo, logits, prior, targets, gt_feats, pair_feats)
             if self.vision_regularize:
@@ -1364,18 +1434,22 @@ class UPT(nn.Module):
             loss_dict = dict(
                 interaction_loss=interaction_loss
             )
-            # if interaction_loss.isnan():
             if self.language_aware:
                 self.origin_text_embeddings = self.origin_text_embeddings.to(self.adapter_union_weight.device)
-                # language_aware_loss = (1 - torch.diagonal((self.adapter_union_weight / self.adapter_union_weight.norm(dim=-1, keepdim=True)) @ self.origin_text_embeddings.T)).mean()
                 sim_matrix = (self.adapter_union_weight / self.adapter_union_weight.norm(dim=-1, keepdim=True)) @ self.origin_text_embeddings.T
                 language_aware_loss = nn.CrossEntropyLoss()(sim_matrix, torch.arange(sim_matrix.shape[0]).to(self.adapter_union_weight.device))
                 loss_dict['language_aware_loss'] = self.LA_weight * language_aware_loss
             return loss_dict
+        
         if len(logits) == 0:
-            print(targets)
+            print(targets[0]['filename'])
             return None
-        detections = self.postprocessing(boxes, bh, bo, logits, prior, objects, image_sizes)
+        detections = self.postprocessing(boxes, bh, bo, logits, prior, objects, image_sizes, no_prior=False)
+        # debug
+        detections[0]['image'] = images_noaug[0]
+        detections[0]['src_size'] = image_sizes[0]
+        detections[0]['dst_size'] = images_noaug[0].shape[1:]
+        detections[0]['sam'] = self.use_sam
         return detections
 
 
@@ -1422,7 +1496,7 @@ def get_origin_text_emb(args, clip_model, tgt_class_names, obj_class_names):
     return origin_text_embedding, object_embedding
 
 
-def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_path, num_anno, verb2interaction=None):
+def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_path, num_anno):
     detr, _, postprocessors = build_model(args)
     if os.path.exists(args.pretrained):
         if dist.get_rank() == 0:
@@ -1442,6 +1516,8 @@ def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_pa
         classnames = vcoco_verbs_sentence
     elif args.num_classes == 600:
         classnames = list(hico_text_label.hico_text_label.values())
+    elif args.num_classes == 12:
+        classnames = gta_text_label
     else:
         raise NotImplementedError
     model = CustomCLIP(args, classnames=classnames, clip_model=clip_model)
@@ -1452,7 +1528,7 @@ def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_pa
     origin_text_embeddings = origin_text_embeddings.clone().detach()
     object_embedding = object_embedding.clone().detach()
     
-    detector = UPT(args,
+    detector = UPT(args, 
         detr, postprocessors['bbox'], model, origin_text_embeddings, object_embedding,
         human_idx=args.human_idx, num_classes=args.num_classes,
         alpha=args.alpha, gamma=args.gamma,
@@ -1466,6 +1542,10 @@ def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_pa
         # verb2interaction = verb2interaction,
         use_mlp_proj = args.use_mlp_proj,
         featmap_dropout_rate=args.featmap_dropout_rate,
+        use_sam = args.use_sam,
+        sam_path = args.sam_path,
+        sam_coef = args.sam_coef,
+        sam_cache = args.cache_sam
     )
     return detector
 
