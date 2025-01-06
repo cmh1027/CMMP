@@ -3,5 +3,5 @@ Forked repository of [[ECCV 2024] Exploring Conditional Multi-Modal Prompts for 
 1. Replace DETR detector with [Grounded-SAM-2](https://github.com/IDEA-Research/Grounded-SAM-20). You must clone this repo and designate its path when run this repo. (refer to scripts/gta.sh)
 
 2. Support of [GTA Dataset](https://drive.google.com/file/d/16RLjgMOcWUTb8DcV060YUZri_qX-08wl/view?usp=sharing)
-![000000_1130_ExtraSunny_helicopter_20240802165305_1](https://github.com/user-attachments/assets/e3dbc800-5a8b-48ea-9ab2-a7086309c4bc)
+![00005](https://github.com/user-attachments/assets/9b5a3397-744d-4f88-9271-8f3be7163310)
 
